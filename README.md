@@ -14,7 +14,7 @@ Hydrover Oxymatic controllers communicate with the cloud via an internal ESP8266
 Previously, integrations monitored the controller by scraping the user-facing web portal (`oxymaticapp.hydrover.eu/devices/DeviceStatus?id=...`). This frequently failed with:
 > *"Connection error / Check device connection"*
 
-Packet inspection revealed why: Hydrover's cloud backend periodically rejected the controller's hardware authentication token (`OcmBdeWb00y8b62OOX1k`) with `401 Unauthorized`. Whenever this happened, the controller halted its transmission loop and displayed a connection error.
+Packet inspection revealed why: Hydrover's cloud backend periodically rejected the controller's hardware authentication token with `401 Unauthorized`. Whenever this happened, the controller halted its transmission loop and displayed a connection error.
 
 ### The Wire Protocol
 When routed locally, packet analysis of the controller's outbound communications revealed:
@@ -24,12 +24,12 @@ When routed locally, packet analysis of the controller's outbound communications
 3. **Certificate Validation:** **Disabled in firmware.** The ESP accepts self-signed certificates without CA validation or certificate pinning (`WiFiClientSecure.setInsecure()`).
 4. **Telemetry Uplink (every ~16 seconds):**
    ```http
-   GET /rest/SetDeviceData?token=OcmBdeWb00y8b62OOX1k&device=Oxymatic&from=readings&guid=2034343557525316002B002E&message="PH":"7.2","RX":"300.437000","CL":"0.00","CU":"0.10","Volts":"10.63","Amps":"0.02","IsPump":"false","Temp":"10.8","PHAlert":"1","RXAlert":"3","CUAlert":"4","CLAlert":"4","PHDepoAlert":"false","RXDepoAlert":"false","PERDepoAlert":"false","IonPerMode":"ION","TempAlert":"3","IsOxyLed2":"false","IsOxyLed1":"false","IsIonLed2":"false","IsIonLed1":"false","IonState":"0","OxyState":"0" HTTP/1.0
+   GET /rest/SetDeviceData?token=<DEVICE_TOKEN>&device=Oxymatic&from=readings&guid=<DEVICE_GUID>&message="PH":"7.2","RX":"300.437000","CL":"0.00","CU":"0.10","Volts":"10.63","Amps":"0.02","IsPump":"false","Temp":"10.8","PHAlert":"1","RXAlert":"3","CUAlert":"4","CLAlert":"4","PHDepoAlert":"false","RXDepoAlert":"false","PERDepoAlert":"false","IonPerMode":"ION","TempAlert":"3","IsOxyLed2":"false","IsOxyLed1":"false","IsIonLed2":"false","IsIonLed1":"false","IonState":"0","OxyState":"0" HTTP/1.0
    Connection: close
    ```
 5. **Command Polling (every ~16 seconds):**
    ```http
-   GET /rest/GetLastEdition?from=device&device=Oxymatic&guid=2034343557525316002B002E&token=OcmBdeWb00y8b62OOX1k HTTP/1.0
+   GET /rest/GetLastEdition?from=device&device=Oxymatic&guid=<DEVICE_GUID>&token=<DEVICE_TOKEN> HTTP/1.0
    Connection: close
    ```
 6. **Telemetry Fields Decoded:**
@@ -40,6 +40,8 @@ When routed locally, packet analysis of the controller's outbound communications
    | `Temp` | Water Temperature (°C) | `homeassistant/sensor/oxymatic/temperature/state` |
    | `Amps` | Hydrolysis (OXY) current (A) | `homeassistant/sensor/oxymatic/oxy_current/state` |
    | `Volts` | Hydrolysis (OXY) voltage (V) | `homeassistant/sensor/oxymatic/oxy_voltage/state` |
+   | `IonAmps` | Ionization (ION) current (A) | `homeassistant/sensor/oxymatic/ion_current/state` |
+   | `IonVolts` | Ionization (ION) voltage (V) | `homeassistant/sensor/oxymatic/ion_voltage/state` |
    | `CU` | Copper ionization level (mg/L) | `homeassistant/sensor/oxymatic/copper/state` |
    | `IsPump` | Controller filtration pump relay | `homeassistant/binary_sensor/oxymatic/pump/state` |
    | `OxyState` | Hydrolysis operating state | Published via mode |
@@ -76,6 +78,8 @@ The bridge implements standard **Home Assistant MQTT Discovery**. On startup, it
 | `sensor.oxymatic_redox` | Sensor | Redox / ORP in mV |
 | `sensor.oxymatic_oxy_current` | Sensor | Oxidation Current in A |
 | `sensor.oxymatic_oxy_voltage` | Sensor | Oxidation Voltage in V |
+| `sensor.oxymatic_ion_current` | Sensor | Ionization Current in A |
+| `sensor.oxymatic_ion_voltage` | Sensor | Ionization Voltage in V |
 | `sensor.oxymatic_copper` | Sensor | Copper level |
 | `select.oxymatic_mode` | Select | Operating Mode (`auto`, `man`, `off`) |
 | `sensor.oxymatic_prog` | Sensor | Active Program (`AUTO TEMP`) |
