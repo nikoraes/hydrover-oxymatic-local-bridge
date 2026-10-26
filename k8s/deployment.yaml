@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oxymatic-local-bridge
+  namespace: oxymatic
+  labels:
+    app.kubernetes.io/name: oxymatic-local-bridge
+    app.kubernetes.io/part-of: home-k8s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oxymatic-local-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oxymatic-local-bridge
+    spec:
+      containers:
+        - name: bridge
+          image: ghcr.io/nikoraes/hydrover-oxymatic-local-bridge:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DEVICE_ID
+              value: oxymatic
+            - name: DEVICE_NAME
+              value: Oxymatic
+            - name: MQTT_HOST
+              value: mosquitto.mosquitto.svc.cluster.local
+            - name: MQTT_PORT
+              value: "8883"
+            - name: MQTT_TLS
+              value: "true"
+            - name: MQTT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: oxymatic-secrets
+                  key: MQTT_USERNAME
+            - name: MQTT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: oxymatic-secrets
+                  key: MQTT_PASSWORD
+          ports:
+            - containerPort: 8443
+              name: https
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

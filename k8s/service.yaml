@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: oxymatic-local-bridge
+  namespace: oxymatic
+  labels:
+    app.kubernetes.io/name: oxymatic-local-bridge
+    app.kubernetes.io/part-of: home-k8s
+spec:
+  externalIPs:
+    - 20.61.77.136
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: oxymatic-local-bridge
