@@ -6,8 +6,8 @@ A local drop-in emulator and MQTT bridge for Hydrover Oxymatic pool controllers.
 
 Intercepts outbound HTTPS/TLS telemetry sent by the Oxymatic controller's ESP
 Wi-Fi module (via DNS rewrite or static router deflection), publishes it to
-Mosquitto MQTT using Home Assistant MQTT Discovery standards, and delivers
-pending setting editions (mode / program / setpoints) back to the controller.
+Mosquitto MQTT using Home Assistant MQTT Discovery standards, and publishes the
+controller's own settings so Home Assistant always shows the truth.
 
 Eliminates all cloud dependencies (oxymaticapp.hydrover.eu / 20.61.77.136).
 
@@ -17,11 +17,29 @@ Uplink protocol (observed from the ESP module, every ~16 s, alternating):
       live measurements
 
   GET /rest/SetDeviceData?from=device&message="IsAuto":"true",...,"Program":"11",...
-      the controller's FULL settings dump — this is the authoritative state for
-      mode and program, and it is what makes closed-loop control verifiable.
+      the controller's FULL settings dump — the authoritative state for
+      mode, program, dosing bands, temperature window, model and firmware.
 
   GET /rest/GetLastEdition?...
-      poll for a pending setting edition; the reply body is applied by the MCU.
+      poll for a pending setting edition (cloud -> controller).
+
+Read-only by design: remote setting changes do NOT work on firmware 1.0.4c.
+There is no cloud->controller command channel we can drive:
+
+  * the `GetLastEdition` reply is ignored whatever we return ("OK", a JSON
+    object, the bare `"Key":"value"` fragment the controller itself emits, a
+    numeric id, or the complete settings dump with one field changed);
+  * the `SetDeviceData` reply is equally ignored, for both `from=readings`
+    and `from=device`;
+  * nothing changes in the controller's next settings dump, and it never
+    issues a follow-up request (so the reply is not an id to fetch either);
+  * the third-party cloud integration for the same hardware exposes program
+    and mode as read-only sensors and only switches the manual outputs, which
+    matches what we observe.
+
+Program and mode are therefore published as sensors. Both are set on the
+controller itself (PROG button; a seasonal, persistent setting), and this
+bridge reports what the controller is actually running.
 
 `Program` is a 1-based index into the controller's pre-set program table
 (Hydrover Oxymatic Smart manual §8.2, table for systems with copper):
@@ -29,15 +47,10 @@ Uplink protocol (observed from the ESP module, every ~16 s, alternating):
   1 AUTO TEMP   2 AUTO ORP    3 USER        4 WINTER
   5 SPRING/AUTUMN  6 SUMMER 20  7 SUMMER 25  8 SUMMER 28
   9 SUMMER 32  10 SUMMER >32  11 PUBLIC POOL  12 FLOW DETECTION
-
-Mode is reported as one of the mutually-exclusive position flags
-IsAuto / IsMan / IsOff.
 """
 
 import os
-import sys
 import json
-import time
 import socket
 import ssl
 import threading
@@ -67,13 +80,6 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8443"))
 CERT_FILE = os.environ.get("CERT_FILE", "/certs/tls.crt")
 KEY_FILE = os.environ.get("KEY_FILE", "/certs/tls.key")
 
-# How long to wait for the controller to confirm an edition before retrying.
-CONFIRM_TIMEOUT = int(os.environ.get("CONFIRM_TIMEOUT", "90"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
-
-COMMAND_TOPIC_MODE = f"homeassistant/select/{DEVICE_ID}/mode/set"
-COMMAND_TOPIC_PROG = f"homeassistant/select/{DEVICE_ID}/prog/set"
-
 # Pre-set program table of the controller firmware (1-based).
 PROGRAMS = {
     1: "AUTO TEMP",
@@ -89,7 +95,6 @@ PROGRAMS = {
     11: "PUBLIC POOL",
     12: "FLOW DETECTION",
 }
-PROGRAM_OPTIONS = [PROGRAMS[i] for i in sorted(PROGRAMS)]
 
 # Mode <-> position flags. Exactly one flag is true in a settings dump.
 MODE_FLAGS = {
@@ -97,52 +102,6 @@ MODE_FLAGS = {
     "man": "IsMan",
     "off": "IsOff",
 }
-MODE_OPTIONS = ["auto", "man", "off"]
-
-
-def _norm(text):
-    """Normalise a program name for lookups: case, spaces, slashes, accents."""
-    return (
-        str(text)
-        .strip()
-        .upper()
-        .replace("_", " ")
-        .replace("/", " ")
-        .replace("-", " ")
-        .replace(">", "")
-        .replace("  ", " ")
-    )
-
-
-PROGRAM_BY_NAME = {_norm(name): code for code, name in PROGRAMS.items()}
-# A few tolerant aliases so a human/automation payload still resolves.
-PROGRAM_BY_NAME.update({
-    _norm("PUBLIC POOL"): 11,
-    _norm("PISCINA PUBLICA"): 11,
-    _norm("SUMMER>32"): 10,
-    _norm("FLOW"): 12,
-})
-
-
-def resolve_program(value):
-    """Map an inbound payload (name or numeric code) to a program code."""
-    text = str(value).strip()
-    if text.isdigit():
-        code = int(text)
-        return code if code in PROGRAMS else None
-    return PROGRAM_BY_NAME.get(_norm(text))
-
-
-def resolve_mode(value):
-    text = str(value).strip().lower()
-    if text in ("auto", "automatic"):
-        return "auto"
-    if text in ("man", "manual"):
-        return "man"
-    if text in ("off", "stop"):
-        return "off"
-    return None
-
 
 # Shared state between MQTT thread and HTTP handler
 state_lock = threading.Lock()
@@ -159,11 +118,6 @@ readings = {
 }
 # Authoritative settings dump from the controller (from=device).
 settings = {}
-# Values we asked for and the controller has not echoed back yet:
-#   key -> {"value": "...", "requested": ts, "attempts": n}
-pending_wanted = {}
-# Edition payload waiting to be handed to the controller on its next poll.
-pending_edition = {}
 mqtt_client = None
 last_published = {}
 
@@ -188,9 +142,8 @@ def generate_self_signed_cert_if_needed(cert_path, key_path):
 # --------------------------------------------------------------------------
 
 def build_discovery_payload(sensor_key, name, unit=None, device_class=None,
-                            component="sensor", options=None, numeric=None,
-                            command_topic=None, attributes_topic=None,
-                            icon=None, object_id=None):
+                            component="sensor", numeric=None,
+                            attributes_topic=None, icon=None, object_id=None):
     """Construct a Home Assistant MQTT Discovery configuration dict."""
     device_info = {
         "identifiers": [DEVICE_ID],
@@ -216,56 +169,50 @@ def build_discovery_payload(sensor_key, name, unit=None, device_class=None,
         payload["icon"] = icon
     if attributes_topic:
         payload["json_attributes_topic"] = attributes_topic
+    if object_id:
+        payload["object_id"] = object_id
 
     # State class measurement for chartable numeric sensors
     if component == "sensor" and (numeric is True or unit is not None):
         payload["state_class"] = "measurement"
 
-    if object_id:
-        payload["object_id"] = object_id
-
-    if component == "select":
-        payload["options"] = options or MODE_OPTIONS
-        payload["command_topic"] = command_topic or f"homeassistant/select/{DEVICE_ID}/{sensor_key}/set"
-        # HA updates the entity optimistically on command; the controller's own
-        # settings dump overwrites it a few seconds later, so the entity always
-        # converges on the truth.
-
     return payload
 
 
 def publish_discovery_configs(client):
-    """Publish Home Assistant MQTT Auto-Discovery definitions."""
+    """Publish (or retire) Home Assistant MQTT Auto-Discovery definitions."""
     configs = [
-        # sensor_key, name, unit, device_class, component, options, numeric, command_topic
-        ("temperature", "Temperature", "°C", "temperature", "sensor", None, True, None),
-        ("pH", "pH", None, "ph", "sensor", None, True, None),
-        ("redox", "Redox", "mV", None, "sensor", None, True, None),
-        ("oxy_current", "OXY Current", "A", "current", "sensor", None, True, None),
-        ("oxy_voltage", "OXY Voltage", "V", "voltage", "sensor", None, True, None),
-        ("ion_current", "ION Current", "A", "current", "sensor", None, True, None),
-        ("ion_voltage", "ION Voltage", "V", "voltage", "sensor", None, True, None),
-        ("copper", "Copper (CU)", "mg/l", None, "sensor", None, True, None),
-        ("mode", "Mode", None, None, "select", MODE_OPTIONS, False, COMMAND_TOPIC_MODE),
-        ("prog", "Program", None, None, "sensor", None, False, None),
-        ("prog_sel", "Oxymatic programma", None, None, "select", PROGRAM_OPTIONS, False,
-         COMMAND_TOPIC_PROG),
-        ("cell", "Electrolyse cel", None, "problem", "binary_sensor", None, False, None),
-        ("pump", "Pump Running", None, "running", "binary_sensor", None, False, None),
+        # sensor_key, name, unit, device_class, component, numeric
+        ("temperature", "Temperature", "°C", "temperature", "sensor", True),
+        ("pH", "pH", None, "ph", "sensor", True),
+        ("redox", "Redox", "mV", None, "sensor", True),
+        ("oxy_current", "OXY Current", "A", "current", "sensor", True),
+        ("oxy_voltage", "OXY Voltage", "V", "voltage", "sensor", True),
+        ("ion_current", "ION Current", "A", "current", "sensor", True),
+        ("ion_voltage", "ION Voltage", "V", "voltage", "sensor", True),
+        ("copper", "Copper (CU)", "mg/l", None, "sensor", True),
+        ("prog", "Program", None, None, "sensor", False),
+        ("mode", "Mode", None, None, "sensor", False),
+        ("cell", "Electrolyse cel", None, "problem", "binary_sensor", False),
+        ("pump", "Pump Running", None, "running", "binary_sensor", False),
     ]
 
-    for sensor_key, name, unit, dev_class, comp, opts, num, cmd_top in configs:
+    for sensor_key, name, unit, dev_class, comp, num in configs:
         attributes_topic = None
         icon = None
         object_id = None
         if sensor_key == "prog":
             attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/prog/attributes"
             icon = "mdi:calendar-clock"
+        if sensor_key == "mode":
+            icon = "mdi:auto-mode"
+            attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/mode/attributes"
         if sensor_key == "pH":
             attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/pH/attributes"
         if sensor_key == "cell":
             # Without an explicit object_id HA derives the entity id from the
-            # (localised) name and area, e.g. binary_sensor.tuinhuis_oxymatic_electrolyse_cel.
+            # (localised) name and area, e.g.
+            # binary_sensor.tuinhuis_oxymatic_electrolyse_cel.
             object_id = f"{DEVICE_ID}_cell"
         topic = f"homeassistant/{comp}/{DEVICE_ID}/{sensor_key}/config"
         payload = build_discovery_payload(
@@ -274,9 +221,7 @@ def publish_discovery_configs(client):
             unit=unit,
             device_class=dev_class,
             component=comp,
-            options=opts,
             numeric=num,
-            command_topic=cmd_top,
             attributes_topic=attributes_topic,
             icon=icon,
             object_id=object_id,
@@ -284,13 +229,18 @@ def publish_discovery_configs(client):
         client.publish(topic, json.dumps(payload), retain=True)
         logger.debug("Published discovery config for %s", sensor_key)
 
-    # Clear discovery payloads left behind by the retired cloud-scraping bridge.
+    # Retire entities the bridge used to publish but cannot honour: the
+    # controller does not accept remote setting changes.
     for stale in (
+        f"homeassistant/select/{DEVICE_ID}/mode/config",
+        f"homeassistant/select/{DEVICE_ID}/prog_sel/config",
+        f"homeassistant/select/{DEVICE_ID}/mode/state",
+        f"homeassistant/select/{DEVICE_ID}/prog_sel/state",
         f"homeassistant/sensor/undefined/oxy_current/config",
         f"homeassistant/sensor/undefined/oxy_voltage/config",
     ):
         client.publish(stale, "", retain=True)
-    # The old bridge published login errors on this retained topic.
+    # The old cloud-scraping bridge published login errors on this topic.
     client.publish(f"homeassistant/text/{DEVICE_ID}/alert/state", "", retain=True)
 
     logger.info("Published all Home Assistant MQTT discovery configs")
@@ -305,8 +255,7 @@ def publish_state(client, sensor_key, value, component="sensor", force=False,
     val_str = str(value).replace(",", ".")
     cache_key = f"{component}/{sensor_key}"
     attrs_str = None if attributes is None else json.dumps(attributes, ensure_ascii=False, sort_keys=True)
-    cached = last_published.get(cache_key)
-    if not force and cached == (val_str, attrs_str):
+    if not force and last_published.get(cache_key) == (val_str, attrs_str):
         return
     last_published[cache_key] = (val_str, attrs_str)
     client.publish(topic, val_str, retain=True)
@@ -370,25 +319,21 @@ def publish_settings_state(client, force=False):
     """Publish the mode and program reported by the controller itself."""
     mode = current_mode()
     if mode:
-        publish_state(client, "mode", mode, component="select", force=force)
+        publish_state(client, "mode", mode, force=force, attributes={
+            "source": "controller",
+            "remote_control": settings.get("RemoteControl"),
+        })
 
     program = current_program()
     if program:
-        raw_code = settings.get("Program")
+        raw_code = str(settings.get("Program", "")).strip()
         publish_state(client, "prog", program, force=force, attributes={
-            "code": int(str(raw_code).strip()) if str(raw_code).strip().isdigit() else raw_code,
+            "code": int(raw_code) if raw_code.isdigit() else raw_code,
             "source": "controller",
             "model": settings.get("Model"),
             "firmware": settings.get("Version"),
             "mode": mode,
         })
-        # The select shares the state topic; republish so HA keeps both in sync.
-        publish_state(client, "prog_sel", program, component="select", force=force)
-
-
-def publish_alert(client, message):
-    """Publish a diagnostic message (empty string clears it)."""
-    client.publish(f"homeassistant/text/{DEVICE_ID}/alert/state", message, retain=True)
 
 
 # --------------------------------------------------------------------------
@@ -400,55 +345,11 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info("Connected to Mosquitto MQTT broker at %s:%d", MQTT_HOST, MQTT_PORT)
         publish_discovery_configs(client)
-        client.subscribe(COMMAND_TOPIC_MODE)
-        client.subscribe(COMMAND_TOPIC_PROG)
-        logger.info("Subscribed to command topics: %s, %s", COMMAND_TOPIC_MODE, COMMAND_TOPIC_PROG)
         with state_lock:
             publish_settings_state(client, force=True)
             publish_readings(client)
     else:
         logger.error("Failed to connect to MQTT broker, return code %s", rc)
-
-
-def queue_edition(client, wanted, edition):
-    """Queue setting values for the controller and track them until confirmed."""
-    now = time.time()
-    with state_lock:
-        for key, value in wanted.items():
-            previous = pending_wanted.get(key)
-            pending_wanted[key] = {
-                "value": str(value),
-                "edition": dict(edition),
-                "requested": now,
-                "attempts": 1 if previous is None else previous.get("attempts", 1) + 1,
-            }
-        pending_edition.update(edition)
-    logger.info("Queued edition for controller: %s (awaiting confirmation)", edition)
-
-
-def on_mqtt_message(client, userdata, msg):
-    """Handle incoming control commands from Home Assistant or Node-RED."""
-    topic = msg.topic
-    payload = msg.payload.decode("utf-8").strip()
-    logger.info("MQTT Command received on %s: %s", topic, payload)
-
-    if topic == COMMAND_TOPIC_MODE:
-        mode = resolve_mode(payload)
-        if mode is None:
-            logger.warning("Unknown mode command: %s", payload)
-            return
-        flag = MODE_FLAGS[mode]
-        edition = {name: ("true" if name == flag else "false") for name in MODE_FLAGS.values()}
-        queue_edition(client, {flag: "true"}, edition)
-
-    elif topic == COMMAND_TOPIC_PROG:
-        code = resolve_program(payload)
-        if code is None:
-            logger.warning("Unknown program command: %s (valid: %s)", payload,
-                           ", ".join(PROGRAM_OPTIONS))
-            publish_alert(client, f"Onbekend programma: {payload}")
-            return
-        queue_edition(client, {"Program": str(code)}, {"Program": str(code)})
 
 
 # --------------------------------------------------------------------------
@@ -494,8 +395,6 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
 
     def handle_set_device_data(self, params):
         """Processes incoming telemetry from the Oxymatic controller."""
-        guid = params.get("guid", [""])[0]
-        token = params.get("token", [""])[0]
         raw_message = params.get("message", [""])[0]
         source = params.get("from", [""])[0]
 
@@ -568,73 +467,45 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
     def _apply_settings(self, data):
         """Full settings dump: authoritative mode / program / setpoints."""
         with state_lock:
+            changed = (settings.get("Program") != data.get("Program") or
+                       settings.get("IsAuto") != data.get("IsAuto") or
+                       settings.get("IsMan") != data.get("IsMan") or
+                       settings.get("IsOff") != data.get("IsOff"))
             settings.clear()
             settings.update(data)
 
             mode = current_mode()
             program = current_program()
-            logger.info(
-                "Settings: mode=%s, program=%s (code %s), model=%s fw=%s, pH band %s-%s, "
-                "temp %s-%s, pump-time %s",
-                mode, program, settings.get("Program"), settings.get("Model"),
-                settings.get("Version"), settings.get("PH0"), settings.get("PH100"),
-                settings.get("TempMin"), settings.get("TempMax"), settings.get("TimePump"),
-            )
-
-            # Did the controller confirm what we asked for?
-            now = time.time()
-            confirmed = []
-            expired = []
-            for key, want in list(pending_wanted.items()):
-                actual = str(settings.get(key, "")).strip().lower()
-                if actual == want["value"].lower():
-                    confirmed.append(f"{key}={want['value']}")
-                    del pending_wanted[key]
-                elif now - want["requested"] > CONFIRM_TIMEOUT:
-                    if want["attempts"] >= MAX_RETRIES:
-                        expired.append(f"{key}={want['value']}")
-                        del pending_wanted[key]
-                    else:
-                        logger.warning(
-                            "Controller has not applied %s=%s after %.0fs — re-sending (attempt %d)",
-                            key, want["value"], now - want["requested"], want["attempts"] + 1,
-                        )
-                        pending_wanted[key] = dict(want, requested=now,
-                                                   attempts=want["attempts"] + 1)
-                        pending_edition.update(want["edition"])
-
-            if confirmed:
-                logger.info("Controller confirmed: %s", ", ".join(confirmed))
-                if not pending_wanted and mqtt_client:
-                    publish_alert(mqtt_client, "")
-
-            if expired:
-                logger.error("Controller refused/ignored: %s", ", ".join(expired))
-                if mqtt_client:
-                    publish_alert(mqtt_client, "Kon niet instellen: " + ", ".join(expired))
+            if changed:
+                logger.info(
+                    "Settings changed: mode=%s, program=%s (code %s)",
+                    mode, program, settings.get("Program"),
+                )
+            else:
+                logger.debug(
+                    "Settings: mode=%s, program=%s (code %s), model=%s fw=%s, "
+                    "pH band %s-%s, temp %s-%s, pump-time %s",
+                    mode, program, settings.get("Program"), settings.get("Model"),
+                    settings.get("Version"), settings.get("PH0"), settings.get("PH100"),
+                    settings.get("TempMin"), settings.get("TempMax"), settings.get("TimePump"),
+                )
 
             if mqtt_client and mqtt_client.is_connected():
-                publish_settings_state(mqtt_client, force=bool(confirmed))
+                publish_settings_state(mqtt_client, force=changed)
 
     def handle_get_last_edition(self, params):
-        """Replies to the controller's command poll with pending settings editions."""
-        response_data = b"OK"
-        content_type = "text/plain"
+        """Reply to the controller's edition poll.
 
-        with state_lock:
-            if pending_edition:
-                edition = dict(pending_edition)
-                pending_edition.clear()
-                logger.info("Delivering pending edition to controller: %s", edition)
-                response_data = json.dumps(edition).encode("utf-8")
-                content_type = "application/json; charset=utf-8"
-
+        The controller applies nothing we return (see module docstring), so
+        there is no edition to hand out: answer a plain OK.
+        """
+        body = b"OK"
         self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(response_data)))
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(response_data)
+        self.wfile.write(body)
 
     def handle_get_device_data(self):
         """Compatibility endpoint for status queries."""
@@ -644,7 +515,6 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
                 "settings": settings,
                 "mode": current_mode(),
                 "program": current_program(),
-                "pending": pending_wanted,
             }).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -671,7 +541,6 @@ def start_mqtt():
         mqtt_client.tls_insecure_set(True)
 
     mqtt_client.on_connect = on_mqtt_connect
-    mqtt_client.on_message = on_mqtt_message
 
     logger.info("Connecting to MQTT broker %s:%d...", MQTT_HOST, MQTT_PORT)
     try:
