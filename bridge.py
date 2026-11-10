@@ -193,7 +193,7 @@ def publish_discovery_configs(client):
         ("copper", "Copper (CU)", "mg/l", None, "sensor", True),
         ("prog", "Program", None, None, "sensor", False),
         ("mode", "Mode", None, None, "sensor", False),
-        ("cell", "Electrolyse cel", None, "problem", "binary_sensor", False),
+        ("cell", "Zout laag", None, "problem", "binary_sensor", False),
         ("pump", "Pump Running", None, "running", "binary_sensor", False),
     ]
 
@@ -285,14 +285,16 @@ def publish_readings(client):
     pump_state = "ON" if str(readings["is_pump"]).lower() == "true" else "OFF"
     publish_state(client, "pump", pump_state, component="binary_sensor")
 
-    # Electrode health, straight from the Hydrover manual: the cell voltage must
-    # stay under 9.5 V; at or above it the water lacks salinity and the cell
-    # cannot produce (amps collapse to ~0).
+    # Electrode health. Only meaningful while the cell is actually producing:
+    # the controller keeps the cell off (temperature protection, ~15 °C floor),
+    # and an idle cell reads a float voltage around 10.6 V with ~0 A. That is
+    # not a fault, so the rule only arms once current is flowing.
     try:
         volts = float(str(readings["oxy_voltage"]).replace(",", "."))
-        cell_problem = "ON" if volts >= 9.5 else "OFF"
+        amps = float(str(readings["oxy_current"]).replace(",", "."))
     except (TypeError, ValueError):
-        cell_problem = "OFF"
+        volts = amps = 0.0
+    cell_problem = "ON" if (amps >= 1.0 and volts >= 9.5) else "OFF"
     publish_state(client, "cell", cell_problem, component="binary_sensor")
 
 

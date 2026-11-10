@@ -120,9 +120,12 @@ When routed locally, packet analysis of the controller's outbound communications
    installation), which is why a cold pool under AUTO TEMP stops dosing pH/ORP entirely.
    Set the program with the **PROG** button on the controller; it persists.
 
-10. **Electrode health.** Per the same manual, the cell voltage must stay **below 9.5 V**
-    (amps 6–12 A). At or above 9.5 V the water lacks salinity and production collapses to
-    ~0 A. The bridge exposes `binary_sensor.oxymatic_cell` (`ON` = problem) from `Volts`.
+10. **Electrode health (`binary_sensor.oxymatic_cell`, "Zout laag").** Per the manual the
+    cell voltage must stay **below 9.5 V** while producing (amps 6–12 A). The rule only
+    arms **under load** (`Amps >= 1 A`): the controller keeps the cell off below ~15 °C
+    water temperature, and an idle cell floats at ~10.6 V with ~0 A — measuring that as a
+    fault is wrong, which is exactly how the first version of this sensor misreported a
+    healthy, temperature-protected cell.
 
 ---
 
