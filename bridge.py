@@ -41,12 +41,14 @@ Program and mode are therefore published as sensors. Both are set on the
 controller itself (PROG button; a seasonal, persistent setting), and this
 bridge reports what the controller is actually running.
 
-`Program` is a 1-based index into the controller's pre-set program table
-(Hydrover Oxymatic Smart manual §8.2, table for systems with copper):
+`Program` is a 1-based index into the controller's pre-set program table. The
+numbering below was corrected against the device itself (display shows WINTER
+while the uplink reports 5, and PUBLIC POOL while it reports 11); the manual's
+printed table is offset by one from WINTER onwards:
 
-  1 AUTO TEMP   2 AUTO ORP    3 USER        4 WINTER
-  5 SPRING/AUTUMN  6 SUMMER 20  7 SUMMER 25  8 SUMMER 28
-  9 SUMMER 32  10 SUMMER >32  11 PUBLIC POOL  12 FLOW DETECTION
+  1 AUTO TEMP   2 AUTO ORP   3 USER   4 unknown   5 WINTER
+  6 SPRING/AUTUMN  7 SUMMER 20  8 SUMMER 25  9 SUMMER 28
+  10 SUMMER 32  11 PUBLIC POOL  12 FLOW DETECTION
 """
 
 import os
@@ -85,16 +87,20 @@ PROGRAMS = {
     1: "AUTO TEMP",
     2: "AUTO ORP",
     3: "USER",
-    4: "WINTER",
-    5: "SPRING/AUTUMN",
-    6: "SUMMER 20",
-    7: "SUMMER 25",
-    8: "SUMMER 28",
-    9: "SUMMER 32",
-    10: "SUMMER >32",
+    # 4 is not documented and has not been identified on the device yet: the
+    # firmware list carries one entry more than the manual's printed table
+    # before WINTER. Reported as "PROGRAMMA 4" until it is read off the display.
+    5: "WINTER",
+    6: "SPRING/AUTUMN",
+    7: "SUMMER 20",
+    8: "SUMMER 25",
+    9: "SUMMER 28",
+    10: "SUMMER 32",
     11: "PUBLIC POOL",
     12: "FLOW DETECTION",
 }
+# Codes known to exist on this firmware even when their name is unknown.
+KNOWN_CODES = range(1, 13)
 
 # Mode <-> position flags. Exactly one flag is true in a settings dump.
 MODE_FLAGS = {
@@ -312,9 +318,16 @@ def current_program():
     if raw is None:
         return None
     try:
-        return PROGRAMS.get(int(str(raw).strip()))
+        code = int(str(raw).strip())
     except ValueError:
         return None
+    if code in PROGRAMS:
+        return PROGRAMS[code]
+    # Known code, name not identified yet: show the code rather than nothing,
+    # so the entity never keeps a stale program name.
+    if code in KNOWN_CODES:
+        return f"PROGRAMMA {code}"
+    return None
 
 
 def publish_settings_state(client, force=False):

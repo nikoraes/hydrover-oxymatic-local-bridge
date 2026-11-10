@@ -101,20 +101,26 @@ When routed locally, packet analysis of the controller's outbound communications
 9. **Program table (firmware codes).** From the Hydrover OXYMATIC smart manual §8.2,
    table for systems with copper (the `SMARTPlus80 PH CU` hardware):
 
-   | Code | Program | Oxy runtime | Ion |
-   |---|---|---|---|
-   | 1 | AUTO TEMP | depends on water temperature | – |
-   | 2 | AUTO ORP | depends on ORP | – |
-   | 3 | USER | user configured | – |
-   | 4 | WINTER | 4:50 h | 10 min |
-   | 5 | SPRING/AUTUMN | 7:45 h | 10 min |
-   | 6 | SUMMER 20 | 10 h | 10 min |
-   | 7 | SUMMER 25 | 12 h | 15 min |
-   | 8 | SUMMER 28 | 14 h | 20 min |
-   | 9 | SUMMER 32 | 16 h | 30 min |
-   | 10 | SUMMER >32 | on request | – |
-   | 11 | PUBLIC POOL | 24 h | 20 min |
-   | 12 | FLOW DETECTION | depends on flow | – |
+   | Code | Program | Oxy runtime | Ion | Source |
+   |---|---|---|---|---|
+   | 1 | AUTO TEMP | depends on water temperature | – | manual order |
+   | 2 | AUTO ORP | depends on ORP | – | manual order |
+   | 3 | USER | user configured | – | manual order |
+   | 4 | *unknown* | – | – | not identified on the device yet |
+   | 5 | WINTER | 4:50 h | 10 min | **confirmed on the display** |
+   | 6 | SPRING/AUTUMN | 7:45 h | 10 min | inferred (follows WINTER) |
+   | 7 | SUMMER 20 | 10 h | 10 min | inferred |
+   | 8 | SUMMER 25 | 12 h | 15 min | inferred |
+   | 9 | SUMMER 28 | 14 h | 20 min | inferred |
+   | 10 | SUMMER 32 | 16 h | 30 min | inferred |
+   | 11 | PUBLIC POOL | 24 h | 20 min | **observed on the device** |
+   | 12 | FLOW DETECTION | depends on flow | – | inferred |
+
+   The manual's printed table (§8.2) is **offset by one from WINTER onwards**: the firmware
+   carries an extra entry between USER and WINTER, so setting WINTER on the controller
+   reports `Program=5`, not 4, while PUBLIC POOL still reports 11. The firmware also has no
+   selectable "SUMMER >32" entry (the manual lists it as "a consultar"). Codes whose name is
+   not identified are published as `PROGRAMMA <code>` so the entity never shows a stale name.
 
    **AUTO TEMP only treats inside the `TempMin`…`TempMax` window** (3.0–11.0 °C on this
    installation), which is why a cold pool under AUTO TEMP stops dosing pH/ORP entirely.
