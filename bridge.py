@@ -190,7 +190,7 @@ def generate_self_signed_cert_if_needed(cert_path, key_path):
 def build_discovery_payload(sensor_key, name, unit=None, device_class=None,
                             component="sensor", options=None, numeric=None,
                             command_topic=None, attributes_topic=None,
-                            icon=None):
+                            icon=None, object_id=None):
     """Construct a Home Assistant MQTT Discovery configuration dict."""
     device_info = {
         "identifiers": [DEVICE_ID],
@@ -220,6 +220,9 @@ def build_discovery_payload(sensor_key, name, unit=None, device_class=None,
     # State class measurement for chartable numeric sensors
     if component == "sensor" and (numeric is True or unit is not None):
         payload["state_class"] = "measurement"
+
+    if object_id:
+        payload["object_id"] = object_id
 
     if component == "select":
         payload["options"] = options or MODE_OPTIONS
@@ -254,11 +257,16 @@ def publish_discovery_configs(client):
     for sensor_key, name, unit, dev_class, comp, opts, num, cmd_top in configs:
         attributes_topic = None
         icon = None
+        object_id = None
         if sensor_key == "prog":
             attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/prog/attributes"
             icon = "mdi:calendar-clock"
         if sensor_key == "pH":
             attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/pH/attributes"
+        if sensor_key == "cell":
+            # Without an explicit object_id HA derives the entity id from the
+            # (localised) name and area, e.g. binary_sensor.tuinhuis_oxymatic_electrolyse_cel.
+            object_id = f"{DEVICE_ID}_cell"
         topic = f"homeassistant/{comp}/{DEVICE_ID}/{sensor_key}/config"
         payload = build_discovery_payload(
             sensor_key=sensor_key,
@@ -271,6 +279,7 @@ def publish_discovery_configs(client):
             command_topic=cmd_top,
             attributes_topic=attributes_topic,
             icon=icon,
+            object_id=object_id,
         )
         client.publish(topic, json.dumps(payload), retain=True)
         logger.debug("Published discovery config for %s", sensor_key)
@@ -648,8 +657,11 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
 def start_mqtt():
     """Initialize and run the MQTT client loop."""
     global mqtt_client
+    # Container PIDs are always 1, so include the hostname: without it a
+    # rolling update makes the old and new pod fight over the same client id
+    # and both reconnect in a loop.
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                              client_id=f"oxymatic_bridge_{os.getpid()}")
+                              client_id=f"oxymatic_bridge_{socket.gethostname()}")
 
     if MQTT_USERNAME and MQTT_PASSWORD:
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
