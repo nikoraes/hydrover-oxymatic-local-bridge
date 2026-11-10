@@ -126,12 +126,14 @@ When routed locally, packet analysis of the controller's outbound communications
    installation), which is why a cold pool under AUTO TEMP stops dosing pH/ORP entirely.
    Set the program with the **PROG** button on the controller; it persists.
 
-10. **Electrode health (`binary_sensor.oxymatic_cell`, "Zout laag").** Per the manual the
-    cell voltage must stay **below 9.5 V** while producing (amps 6–12 A). The rule only
-    arms **under load** (`Amps >= 1 A`): the controller keeps the cell off below ~15 °C
-    water temperature, and an idle cell floats at ~10.6 V with ~0 A — measuring that as a
-    fault is wrong, which is exactly how the first version of this sensor misreported a
-    healthy, temperature-protected cell.
+10. **No electrode-health entity (deliberate).** The manual says the cell voltage must stay
+    below 9.5 V while producing and that above it you should add sea salt. That advice only
+    holds for a classic salt/electrolysis pool: this installation is a **natural, planted,
+    chlorine-free pool**, where adding salt is not an option (it harms the plants). The cell
+    is also kept idle below ~15 °C by design, so an unloaded cell floats at ~10.6 V with
+    ~0 A and a voltage-based verdict means nothing. `sensor.oxymatic_oxy_voltage` and
+    `sensor.oxymatic_oxy_current` stay available as raw readings; a "problem" binary sensor
+    for them would be a knob that lies.
 
 ---
 
@@ -169,7 +171,6 @@ The bridge implements standard **Home Assistant MQTT Discovery**. On startup, it
 | `sensor.oxymatic_copper` | Sensor | Copper level |
 | `sensor.oxymatic_program` | Sensor | Active program, from the controller's `Program` code (attributes: code, model, firmware, mode) |
 | `sensor.oxymatic_mode` | Sensor | Operating position, from the controller's `IsAuto`/`IsMan`/`IsOff` flags |
-| `binary_sensor.oxymatic_cell` | Binary Sensor | Cell voltage problem (`ON` when `Volts` ≥ 9.5 V: add salt) |
 | `binary_sensor.oxymatic_pump` | Binary Sensor | Physical pump relay feedback (`ON`/`OFF`) |
 
 ### No write entities

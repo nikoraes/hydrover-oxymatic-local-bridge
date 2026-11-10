@@ -199,7 +199,6 @@ def publish_discovery_configs(client):
         ("copper", "Copper (CU)", "mg/l", None, "sensor", True),
         ("prog", "Program", None, None, "sensor", False),
         ("mode", "Mode", None, None, "sensor", False),
-        ("cell", "Zout laag", None, "problem", "binary_sensor", False),
         ("pump", "Pump Running", None, "running", "binary_sensor", False),
     ]
 
@@ -215,11 +214,6 @@ def publish_discovery_configs(client):
             attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/mode/attributes"
         if sensor_key == "pH":
             attributes_topic = f"homeassistant/sensor/{DEVICE_ID}/pH/attributes"
-        if sensor_key == "cell":
-            # Without an explicit object_id HA derives the entity id from the
-            # (localised) name and area, e.g.
-            # binary_sensor.tuinhuis_oxymatic_electrolyse_cel.
-            object_id = f"{DEVICE_ID}_cell"
         topic = f"homeassistant/{comp}/{DEVICE_ID}/{sensor_key}/config"
         payload = build_discovery_payload(
             sensor_key=sensor_key,
@@ -238,6 +232,8 @@ def publish_discovery_configs(client):
     # Retire entities the bridge used to publish but cannot honour: the
     # controller does not accept remote setting changes.
     for stale in (
+        f"homeassistant/binary_sensor/{DEVICE_ID}/cell/config",
+        f"homeassistant/binary_sensor/{DEVICE_ID}/cell/state",
         f"homeassistant/select/{DEVICE_ID}/mode/config",
         f"homeassistant/select/{DEVICE_ID}/prog_sel/config",
         f"homeassistant/select/{DEVICE_ID}/mode/state",
@@ -291,17 +287,12 @@ def publish_readings(client):
     pump_state = "ON" if str(readings["is_pump"]).lower() == "true" else "OFF"
     publish_state(client, "pump", pump_state, component="binary_sensor")
 
-    # Electrode health. Only meaningful while the cell is actually producing:
-    # the controller keeps the cell off (temperature protection, ~15 °C floor),
-    # and an idle cell reads a float voltage around 10.6 V with ~0 A. That is
-    # not a fault, so the rule only arms once current is flowing.
-    try:
-        volts = float(str(readings["oxy_voltage"]).replace(",", "."))
-        amps = float(str(readings["oxy_current"]).replace(",", "."))
-    except (TypeError, ValueError):
-        volts = amps = 0.0
-    cell_problem = "ON" if (amps >= 1.0 and volts >= 9.5) else "OFF"
-    publish_state(client, "cell", cell_problem, component="binary_sensor")
+    # No electrode-health entity on purpose. The manual's "voltage must stay
+    # under 9.5 V, otherwise add sea salt" only applies to a classic salt/
+    # electrolysis pool: this installation is a natural, planted, chlorine-free
+    # pool where salt is not an option. The cell also sits idle below ~15 °C by
+    # design (float voltage ~10.6 V at ~0 A), so a volts-based verdict says
+    # nothing. Oxy voltage/current are published as raw sensors instead.
 
 
 def current_mode():
