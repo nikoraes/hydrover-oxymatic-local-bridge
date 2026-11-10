@@ -47,6 +47,66 @@ When routed locally, packet analysis of the controller's outbound communications
    | `OxyState` | Hydrolysis operating state | Published via mode |
    | `IonState` | Ionization operating state | Published via mode |
 
+7. **Settings Uplink (every ~16 seconds, alternating with the readings):**
+   ```http
+   GET /rest/SetDeviceData?from=device&message="IsAuto":"true","IsMan":"false",...,"Program":"11",... HTTP/1.0
+   ```
+   The same `/rest/SetDeviceData` endpoint carries a **second message type**: the
+   controller's complete settings dump. It is the only place where the controller states
+   which mode and which **program** it is actually running, so it is the authoritative
+   feedback channel. Selected fields:
+
+   | Field | Meaning |
+   |---|---|
+   | `IsAuto` / `IsMan` / `IsOff` | Mode position (exactly one is `true`) |
+   | `Program` | Active program, a **1-based index** (see table below) |
+   | `PHOn` / `PH0` / `PH100` | pH dosing enabled, band 0 %…100 % (e.g. 7.2 → 8.0) |
+   | `RXOn` / `RX0` / `RX100` | Redox dosing band |
+   | `TempMin` / `TempMax` | Program temperature window |
+   | `OxyCurr` / `IonCurr` / `OxyPolTime` / `IonPolTime` | Electrode current limits and polarity cycle |
+   | `Model` / `Version` / `PhCal` / `RxCal` | Hardware model, firmware, calibration dates |
+   | `RemoteControl` | Whether the controller accepts remote editions |
+
+   > The uplink has no `from=` collision: `readings` and `device` are distinct
+   > messages on the same path. Parsing only the readings and ignoring `device` is what
+   > made the old bridge publish invented mode/program values.
+
+8. **Editions (cloud → controller).** The reply to `/rest/GetLastEdition` is applied by
+   the controller MCU. Field names are the same vocabulary as the settings dump and the
+   values are **strings**:
+   ```json
+   {"Program":"11"}
+   {"IsAuto":"true","IsMan":"false","IsOff":"false"}
+   ```
+   A pending edition is fetched on the next poll (≤16 s) and reapplied at most a couple of
+   times; the controller then reports the new value in its next settings dump, which is
+   what the bridge waits for before considering the command done.
+
+9. **Program table (firmware codes).** From the Hydrover OXYMATIC smart manual §8.2,
+   table for systems with copper (the `SMARTPlus80 PH CU` hardware):
+
+   | Code | Program | Oxy runtime | Ion |
+   |---|---|---|---|
+   | 1 | AUTO TEMP | depends on water temperature | – |
+   | 2 | AUTO ORP | depends on ORP | – |
+   | 3 | USER | user configured | – |
+   | 4 | WINTER | 4:50 h | 10 min |
+   | 5 | SPRING/AUTUMN | 7:45 h | 10 min |
+   | 6 | SUMMER 20 | 10 h | 10 min |
+   | 7 | SUMMER 25 | 12 h | 15 min |
+   | 8 | SUMMER 28 | 14 h | 20 min |
+   | 9 | SUMMER 32 | 16 h | 30 min |
+   | 10 | SUMMER >32 | on request | – |
+   | 11 | PUBLIC POOL | 24 h | 20 min |
+   | 12 | FLOW DETECTION | depends on flow | – |
+
+   **AUTO TEMP only treats inside the `TempMin`…`TempMax` window** (3.0–11.0 °C on this
+   installation), which is why a cold pool under AUTO TEMP stops dosing pH/ORP entirely.
+
+10. **Electrode health.** Per the same manual, the cell voltage must stay **below 9.5 V**
+    (amps 6–12 A). At or above 9.5 V the water lacks salinity and production collapses to
+    ~0 A. The bridge exposes `binary_sensor.oxymatic_cell` (`ON` = problem) from `Volts`.
+
 ---
 
 ## Network Architecture & Traffic Redirection
@@ -81,13 +141,20 @@ The bridge implements standard **Home Assistant MQTT Discovery**. On startup, it
 | `sensor.oxymatic_ion_current` | Sensor | Ionization Current in A |
 | `sensor.oxymatic_ion_voltage` | Sensor | Ionization Voltage in V |
 | `sensor.oxymatic_copper` | Sensor | Copper level |
-| `select.oxymatic_mode` | Select | Operating Mode (`auto`, `man`, `off`) |
-| `sensor.oxymatic_prog` | Sensor | Active Program (`AUTO TEMP`) |
+| `select.oxymatic_mode` | Select | Operating mode (`auto`, `man`, `off`), read back from the settings dump |
+| `sensor.oxymatic_program` | Sensor | Active program name, read back from `Program` (attributes: code, model, firmware) |
+| `select.oxymatic_programma` | Select | Program selection — publishes `{"Program":"<code>"}` editions |
+| `binary_sensor.oxymatic_cell` | Binary Sensor | Cell voltage problem (`ON` when `Volts` ≥ 9.5 V: add salt) |
 | `binary_sensor.oxymatic_pump` | Binary Sensor | Physical pump relay feedback (`ON`/`OFF`) |
 
 ### Commands
 - **Mode Control:** Send `auto`, `man`, or `off` to `homeassistant/select/oxymatic/mode/set`.
-- **Program Control:** Send program name to `homeassistant/select/oxymatic/prog/set`.
+  The edition carries the full position trio (`IsAuto`/`IsMan`/`IsOff`).
+- **Program Control:** Send a program name (`PUBLIC POOL`) or its code (`11`) to
+  `homeassistant/select/oxymatic/prog/set`; the bridge converts it to `{"Program":"11"}`.
+- Every command is confirmed against the controller's next settings dump; unconfirmed
+  commands are retried twice and then reported on
+  `homeassistant/text/oxymatic/alert/state`.
 
 ---
 
