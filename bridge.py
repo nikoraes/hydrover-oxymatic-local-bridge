@@ -648,8 +648,11 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
 def start_mqtt():
     """Initialize and run the MQTT client loop."""
     global mqtt_client
+    # Container PIDs are always 1, so include the hostname: without it a
+    # rolling update makes the old and new pod fight over the same client id
+    # and both reconnect in a loop.
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                              client_id=f"oxymatic_bridge_{os.getpid()}")
+                              client_id=f"oxymatic_bridge_{socket.gethostname()}")
 
     if MQTT_USERNAME and MQTT_PASSWORD:
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
