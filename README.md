@@ -71,16 +71,32 @@ When routed locally, packet analysis of the controller's outbound communications
    > messages on the same path. Parsing only the readings and ignoring `device` is what
    > made the old bridge publish invented mode/program values.
 
-8. **Editions (cloud → controller).** The reply to `/rest/GetLastEdition` is applied by
-   the controller MCU. Field names are the same vocabulary as the settings dump and the
-   values are **strings**:
-   ```json
-   {"Program":"11"}
-   {"IsAuto":"true","IsMan":"false","IsOff":"false"}
-   ```
-   A pending edition is fetched on the next poll (≤16 s) and reapplied at most a couple of
-   times; the controller then reports the new value in its next settings dump, which is
-   what the bridge waits for before considering the command done.
+8. **Editions (cloud → controller): not usable.** `/rest/GetLastEdition` looks like the
+   cloud→controller command channel, but on firmware 1.0.4c the reply is ignored. Tested
+   live, one candidate at a time, checking the next settings dump and watching for any
+   follow-up request:
+
+   | Reply body | Channel | Result |
+   |---|---|---|
+   | `"Program":"4"` (bare fragment) | GetLastEdition | ignored |
+   | `{"Program":"4"}` | GetLastEdition | ignored |
+   | `Program=4` | GetLastEdition | ignored |
+   | `{"prog":"4"}` | GetLastEdition | ignored |
+   | `1` (edition id) | GetLastEdition | ignored, no follow-up request |
+   | `{"TempMax":"9.0"}` | GetLastEdition | ignored |
+   | full settings dump, `Program` changed | GetLastEdition | ignored |
+   | full settings dump, `Program` changed | GetLastEdition | ignored |
+   | full settings dump, `IsAuto`/`IsMan` swapped | GetLastEdition | ignored |
+   | `"TempMax":"9.0"` | SetDeviceData `from=readings` | ignored |
+   | `"TempMax":"9.0"` / `{"TempMax":"9.0"}` | SetDeviceData `from=device` | ignored |
+
+   The third-party cloud integration for the same hardware
+   ([tst-038/ha-oxymatic-smart](https://github.com/tst-038/ha-oxymatic-smart)) exposes
+   program and mode as **read-only sensors** and only switches the manual outputs, which
+   matches: the cloud reads this controller, it does not program it.
+
+   So the bridge is **read-only**: it reports the mode and program the controller is
+   running, and does not offer controls it cannot honour.
 
 9. **Program table (firmware codes).** From the Hydrover OXYMATIC smart manual §8.2,
    table for systems with copper (the `SMARTPlus80 PH CU` hardware):
@@ -102,6 +118,7 @@ When routed locally, packet analysis of the controller's outbound communications
 
    **AUTO TEMP only treats inside the `TempMin`…`TempMax` window** (3.0–11.0 °C on this
    installation), which is why a cold pool under AUTO TEMP stops dosing pH/ORP entirely.
+   Set the program with the **PROG** button on the controller; it persists.
 
 10. **Electrode health.** Per the same manual, the cell voltage must stay **below 9.5 V**
     (amps 6–12 A). At or above 9.5 V the water lacks salinity and production collapses to
@@ -141,20 +158,19 @@ The bridge implements standard **Home Assistant MQTT Discovery**. On startup, it
 | `sensor.oxymatic_ion_current` | Sensor | Ionization Current in A |
 | `sensor.oxymatic_ion_voltage` | Sensor | Ionization Voltage in V |
 | `sensor.oxymatic_copper` | Sensor | Copper level |
-| `select.oxymatic_mode` | Select | Operating mode (`auto`, `man`, `off`), read back from the settings dump |
-| `sensor.oxymatic_program` | Sensor | Active program name, read back from `Program` (attributes: code, model, firmware) |
-| `select.oxymatic_programma` | Select | Program selection — publishes `{"Program":"<code>"}` editions |
+| `sensor.oxymatic_program` | Sensor | Active program, from the controller's `Program` code (attributes: code, model, firmware, mode) |
+| `sensor.oxymatic_mode` | Sensor | Operating position, from the controller's `IsAuto`/`IsMan`/`IsOff` flags |
 | `binary_sensor.oxymatic_cell` | Binary Sensor | Cell voltage problem (`ON` when `Volts` ≥ 9.5 V: add salt) |
 | `binary_sensor.oxymatic_pump` | Binary Sensor | Physical pump relay feedback (`ON`/`OFF`) |
 
-### Commands
-- **Mode Control:** Send `auto`, `man`, or `off` to `homeassistant/select/oxymatic/mode/set`.
-  The edition carries the full position trio (`IsAuto`/`IsMan`/`IsOff`).
-- **Program Control:** Send a program name (`PUBLIC POOL`) or its code (`11`) to
-  `homeassistant/select/oxymatic/prog/set`; the bridge converts it to `{"Program":"11"}`.
-- Every command is confirmed against the controller's next settings dump; unconfirmed
-  commands are retried twice and then reported on
-  `homeassistant/text/oxymatic/alert/state`.
+### No write entities
+
+There are deliberately **no `select`/`switch` entities** for mode or program. Both are set
+on the controller (mode buttons, `PROG` button) and the bridge only reports them; see
+"Editions (cloud → controller): not usable" above. Earlier versions published
+`select.oxymatic_mode` and `select.oxymatic_programma` — they are removed on the next start
+(retained discovery configs are cleared), because a selector that cannot change anything is
+worse than no selector.
 
 ---
 
