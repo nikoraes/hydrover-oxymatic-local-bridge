@@ -57,6 +57,7 @@ import socket
 import ssl
 import threading
 import logging
+import time
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import paho.mqtt.client as mqtt
@@ -126,6 +127,11 @@ readings = {
 settings = {}
 mqtt_client = None
 last_published = {}
+
+# Refresh mode/program even when the value did not change, so Home Assistant's
+# "last updated" stays honest (the controller is read every ~32 s).
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
+_settings_last_force = 0.0
 
 
 def generate_self_signed_cert_if_needed(cert_path, key_path):
@@ -322,7 +328,21 @@ def current_program():
 
 
 def publish_settings_state(client, force=False):
-    """Publish the mode and program reported by the controller itself."""
+    """Publish the mode and program reported by the controller itself.
+
+    The settings dump arrives every ~32 s but the values rarely change, and
+    publishing only on change leaves Home Assistant showing a timestamp days
+    old for something that is being read continuously — which reads as a dead
+    entity. Refresh unconditionally at least every REFRESH_SECONDS so "last
+    updated" means what people think it means.
+    """
+    global _settings_last_force
+    now = time.monotonic()
+    if not force and now - _settings_last_force >= REFRESH_SECONDS:
+        force = True
+    if force:
+        _settings_last_force = now
+
     mode = current_mode()
     if mode:
         publish_state(client, "mode", mode, force=force, attributes={
