@@ -243,6 +243,118 @@ last_published = {}
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
 _settings_last_force = 0.0
 
+# --------------------------------------------------------------------------
+# Write path: a document shaped like the cloud's GetDeviceData can be handed to
+# the controller, which then adopts the program/mode it contains. Home Assistant
+# expresses intent over MQTT; the bridge turns that into a document.
+# --------------------------------------------------------------------------
+TEMPLATE_FILE = os.environ.get(
+    "OX_TEMPLATE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "oxymatic_template.json"))
+PROGRAM_CODES = {name: code for code, name in PROGRAMS.items()}
+MODE_FIELDS = {
+    "auto": {"IsAuto": True, "IsMan": False, "IsOff": False},
+    "man": {"IsAuto": False, "IsMan": True, "IsOff": False},
+    "off": {"IsAuto": False, "IsMan": False, "IsOff": True},
+}
+# What HA has asked for; None = follow the controller.
+desired_program = None
+desired_mode = None
+# Non-zero while an edition is waiting to be picked up (epoch seconds).
+pending_edition = 0.0
+
+COMMAND_TOPICS = {
+    "program": "oxymatic/set/program",
+    "mode": "oxymatic/set/mode",
+}
+
+
+def load_template(path=None):
+    try:
+        with open(path or TEMPLATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if "document" in data and "edition" in data else None
+    except Exception as e:
+        logger.warning("no usable device template at %s: %s", path or TEMPLATE_FILE, e)
+        return None
+
+
+TEMPLATE = load_template()
+
+
+def build_document():
+    """The GetDeviceData document to serve: template + live readings + intent."""
+    if not TEMPLATE:
+        return None
+    doc = dict(TEMPLATE["document"])
+    pairs = (("temperature", "Temp", float), ("pH", "PH", float), ("redox", "RX", float),
+             ("copper", "CU", float), ("oxy_voltage", "Volts", float),
+             ("oxy_current", "Amps", float))
+    for src, dst, caster in pairs:
+        raw = readings.get(src)
+        if raw in (None, ""):
+            continue
+        try:
+            doc[dst] = caster(raw)
+        except (TypeError, ValueError):
+            pass
+    if readings.get("is_pump") is not None:
+        doc["IsPump"] = str(readings["is_pump"]).lower() == "true"
+    if desired_program is not None:
+        doc["Program"] = desired_program
+    if desired_mode in MODE_FIELDS:
+        doc.update(MODE_FIELDS[desired_mode])
+    now_ms = int(time.time() * 1000)
+    doc["LastEdition"] = "/Date(%d)/" % now_ms
+    doc["LastProgEdition"] = "/Date(%d)/" % now_ms
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def build_edition_list():
+    """The GetLastEdition payload advertising the pending edition."""
+    if not TEMPLATE:
+        return None
+    items = [["DataEdition", str(int(pending_edition))]]
+    items += [[k, v] for k, v in TEMPLATE["edition"]]
+    return json.dumps(items, separators=(",", ":")).encode("utf-8")
+
+
+def request_edition():
+    global pending_edition
+    pending_edition = time.time()
+    logger.info("Edition queued (program=%s mode=%s)", desired_program, desired_mode)
+
+
+def apply_program(value):
+    """Set the desired program from a name or a numeric code."""
+    global desired_program
+    text = str(value).strip()
+    code = None
+    if text.isdigit():
+        code = int(text)
+    else:
+        for name, c in PROGRAM_CODES.items():
+            if name.lower() == text.lower():
+                code = c
+                break
+    if code is None:
+        logger.warning("ignoring unknown program %r", value)
+        return False
+    desired_program = code
+    request_edition()
+    return True
+
+
+def apply_mode(value):
+    global desired_mode
+    text = str(value).strip().lower()
+    if text not in MODE_FIELDS:
+        logger.warning("ignoring unknown mode %r (want auto/man/off)", value)
+        return False
+    desired_mode = text
+    request_edition()
+    return True
+
 
 def generate_self_signed_cert_if_needed(cert_path, key_path):
     """Generate a valid self-signed certificate if none exists."""
@@ -345,6 +457,34 @@ def publish_discovery_configs(client):
         client.publish(topic, json.dumps(payload), retain=True)
         logger.debug("Published discovery config for %s", sensor_key)
 
+    # Write entities: these are the settable pair. A command publishes on the
+    # command topic; the bridge queues an edition and the controller adopts it.
+    device_info = {
+        "identifiers": [DEVICE_ID],
+        "name": DEVICE_NAME,
+        "manufacturer": "Hydrover",
+        "model": "Oxymatic Controller (Local)",
+    }
+    selects = [
+        ("programma", "Programma", COMMAND_TOPICS["program"],
+         [name for _, name in sorted(PROGRAMS.items())], "mdi:calendar-clock"),
+        ("mode_select", "Modus", COMMAND_TOPICS["mode"],
+         ["auto", "man", "off"], "mdi:auto-mode"),
+    ]
+    for key, name, command_topic, options, icon in selects:
+        payload = {
+            "name": name,
+            "unique_id": f"{DEVICE_ID}_{key}",
+            "state_topic": f"homeassistant/select/{DEVICE_ID}/{key}/state",
+            "command_topic": command_topic,
+            "options": options,
+            "icon": icon,
+            "device": device_info,
+        }
+        client.publish(f"homeassistant/select/{DEVICE_ID}/{key}/config",
+                       json.dumps(payload), retain=True)
+        logger.debug("Published select discovery config for %s", key)
+
     # Retire entities the bridge used to publish but cannot honour: the
     # controller does not accept remote setting changes.
     for stale in (
@@ -437,6 +577,34 @@ def current_program():
     return None
 
 
+def publish_write_state(client, force=False):
+    """Publish the program/mode HA has asked for (the select entities' state)."""
+    program_name = PROGRAMS.get(desired_program) if desired_program else None
+    if program_name:
+        publish_state(client, "programma", program_name, component="select",
+                      force=force, attributes={"code": desired_program,
+                                               "source": "home-assistant"})
+    if desired_mode:
+        publish_state(client, "mode_select", desired_mode, component="select",
+                      force=force, attributes={"source": "home-assistant"})
+
+
+def on_mqtt_message(client, userdata, msg):
+    """Turn an HA command into a queued edition for the controller."""
+    topic = msg.topic
+    try:
+        value = msg.payload.decode("utf-8", "replace").strip()
+    except Exception:
+        return
+    logger.info("MQTT command on %s: %r", topic, value)
+    if topic == COMMAND_TOPICS["program"]:
+        if apply_program(value):
+            publish_write_state(client, force=True)
+    elif topic == COMMAND_TOPICS["mode"]:
+        if apply_mode(value):
+            publish_write_state(client, force=True)
+
+
 def publish_settings_state(client, force=False):
     """Publish the mode and program reported by the controller itself.
 
@@ -481,6 +649,9 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info("Connected to Mosquitto MQTT broker at %s:%d", MQTT_HOST, MQTT_PORT)
         publish_discovery_configs(client)
+        for topic in COMMAND_TOPICS.values():
+            client.subscribe(topic)
+            logger.info("Subscribed to command topic %s", topic)
         with state_lock:
             publish_settings_state(client, force=True)
             publish_readings(client)
@@ -696,23 +867,45 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
     def handle_get_last_edition(self, params):
         """Reply to the controller's edition poll.
 
-        Default: a plain OK (nothing has been observed to be applied).
-        With EDITION_REPLY / EDITION_REPLY_FILE set, the captured payload is served
-        verbatim so the controller can be observed reacting to a real edition.
+        A queued write (HA asked for a program/mode) advertises a fresh
+        DataEdition, which makes the controller fetch GetDeviceData and adopt it.
+        Otherwise the EDITION_REPLY payload or a plain OK is served.
         """
-        body = b"OK"
-        payload = edition_payload()
-        if payload is not None:
-            body = payload
+        global pending_edition
+        body = None
+        content_type = "text/plain"
+        if pending_edition and TEMPLATE:
+            body = build_edition_list()
+            content_type = "application/json"
+            logger.info("Serving edition DataEdition=%d (program=%s mode=%s)",
+                        int(pending_edition), desired_program, desired_mode)
+        if body is None:
+            body = edition_payload() or b"OK"
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def handle_get_device_data(self):
-        """Compatibility endpoint for status queries."""
+        """Serve the document that carries the requested program/mode."""
+        global pending_edition
+        if pending_edition and TEMPLATE:
+            doc = build_document()
+            if doc:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(doc)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(doc)
+                logger.info("Served document: program=%s mode=%s — edition handed over",
+                            desired_program, desired_mode)
+                pending_edition = 0.0
+                if mqtt_client and mqtt_client.is_connected():
+                    publish_write_state(mqtt_client, force=True)
+                return
         payload = devicedata_payload()
         if payload is not None:
             self.send_response(200)
@@ -754,6 +947,7 @@ def start_mqtt():
         mqtt_client.tls_insecure_set(True)
 
     mqtt_client.on_connect = on_mqtt_connect
+    mqtt_client.on_message = on_mqtt_message
 
     logger.info("Connecting to MQTT broker %s:%d...", MQTT_HOST, MQTT_PORT)
     try:
