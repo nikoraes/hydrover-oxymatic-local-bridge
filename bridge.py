@@ -62,6 +62,61 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import paho.mqtt.client as mqtt
 
+# Request tap: log EVERY request the controller makes, including endpoints this
+# bridge does not implement (e.g. a token refresh after a power cycle).
+REQUEST_LOG_PATH = os.environ.get("REQUEST_LOG", "/tmp/bridge-requests.jsonl")
+
+
+def tap_entry(method, path, http_version, headers, body, client, tls_version=None, cipher=None):
+    """Build one record describing a request as it arrived, unmodified."""
+    hdrs = {}
+    try:
+        hdrs = {str(k): str(v) for k, v in headers.items()}
+    except Exception:
+        pass
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "client": client,
+        "method": method,
+        "path": path,
+        "http": http_version,
+        "tls": tls_version,
+        "cipher": cipher,
+        "headers": hdrs,
+        "body": body.decode("latin-1") if isinstance(body, (bytes, bytearray)) else (body or ""),
+    }
+
+
+KNOWN_ENDPOINTS = ("/rest/SetDeviceData", "/rest/GetLastEdition",
+                   "/rest/GetDeviceData", "/Devices/DeviceStatus")
+TAP_FULL = os.environ.get("TAP_FULL", "").lower() in ("1", "true", "yes")
+
+
+def write_tap(record, path=None, full=None):
+    """Append the record as one JSON line; never raise into the request path.
+
+    Unknown endpoints are dumped in full on stdout, because the container log is
+    the only channel that survives: this catches things like a token refresh that
+    the bridge never implemented.
+    """
+    target = path or REQUEST_LOG_PATH
+    line = json.dumps(record, ensure_ascii=False)
+    if full is None:
+        endpoint = urllib.parse.urlparse(str(record.get("path", ""))).path
+        full = TAP_FULL or endpoint not in KNOWN_ENDPOINTS
+    if full:
+        logger.info("TAP %s", line)
+    else:
+        logger.info("TAP %s %s %s (http=%s tls=%s)",
+                    record.get("client"), record.get("method"),
+                    record.get("path"), record.get("http"), record.get("tls"))
+    try:
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.warning("could not write request log %s: %s", target, e)
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -399,7 +454,55 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.debug("%s - - [%s] %s", self.client_address[0], self.log_date_time_string(), format % args)
 
+    def _tap(self, method):
+        """Log the raw request before any handling decides what to do with it."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        body = b""
+        if length > 0 and method != "GET":
+            try:
+                body = self.rfile.read(length)
+            except Exception:
+                body = b""
+        tls_version = cipher = None
+        try:
+            tls_version = self.connection.version()
+            c = self.connection.cipher()
+            cipher = c[0] if c else None
+        except Exception:
+            pass
+        write_tap(tap_entry(method, self.path, self.request_version, self.headers,
+                            body, self.client_address[0], tls_version, cipher))
+
+    def _reply_ok(self):
+        payload = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        self._tap("POST")
+        self._reply_ok()
+
+    def do_PUT(self):
+        self._tap("PUT")
+        self._reply_ok()
+
+    def do_DELETE(self):
+        self._tap("DELETE")
+        self._reply_ok()
+
+    def do_HEAD(self):
+        self._tap("HEAD")
+        self._reply_ok()
+
     def do_GET(self):
+        self._tap("GET")
         parsed_url = urllib.parse.urlparse(self.path)
         query_params = urllib.parse.parse_qs(parsed_url.query)
 
