@@ -67,6 +67,14 @@ import paho.mqtt.client as mqtt
 REQUEST_LOG_PATH = os.environ.get("REQUEST_LOG", "/tmp/bridge-requests.jsonl")
 
 
+def force_401_endpoint(path, forced=None):
+    """True when this request should be answered with the cloud's 401."""
+    forced = FORCE_401_PATHS if forced is None else forced
+    if not forced:
+        return False
+    return urllib.parse.urlparse(str(path)).path in forced
+
+
 def tap_entry(method, path, http_version, headers, body, client, tls_version=None, cipher=None):
     """Build one record describing a request as it arrived, unmodified."""
     hdrs = {}
@@ -90,6 +98,12 @@ def tap_entry(method, path, http_version, headers, body, client, tls_version=Non
 KNOWN_ENDPOINTS = ("/rest/SetDeviceData", "/rest/GetLastEdition",
                    "/rest/GetDeviceData", "/Devices/DeviceStatus")
 TAP_FULL = os.environ.get("TAP_FULL", "").lower() in ("1", "true", "yes")
+
+# Experiment switch: answer selected endpoints with the cloud's 401 so the
+# controller's reaction (e.g. a token refresh) can be observed in the request log.
+# Empty by default; never affects normal operation.
+FORCE_401_PATHS = [p.strip() for p in os.environ.get("FORCE_401_PATHS", "").split(",") if p.strip()]
+FORCE_401_BODY = b"401 ACCESS TOKEN IS NOT VALID"
 
 
 def write_tap(record, path=None, full=None):
@@ -501,8 +515,24 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
         self._tap("HEAD")
         self._reply_ok()
 
+    def _forced_401(self):
+        """Return the cloud's 401 for configured paths; True when it answered."""
+        if not force_401_endpoint(self.path):
+            return False
+        endpoint = urllib.parse.urlparse(self.path).path
+        logger.warning("FORCE_401 answering %s with 401 (experiment)", endpoint)
+        self.send_response(401)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(FORCE_401_BODY)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(FORCE_401_BODY)
+        return True
+
     def do_GET(self):
         self._tap("GET")
+        if self._forced_401():
+            return
         parsed_url = urllib.parse.urlparse(self.path)
         query_params = urllib.parse.parse_qs(parsed_url.query)
 
