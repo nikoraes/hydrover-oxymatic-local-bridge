@@ -80,6 +80,23 @@ def edition_payload():
     return raw.encode("utf-8") if raw else None
 
 
+def _reply_blob(inline, path):
+    raw = inline
+    if not raw and path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read().strip()
+        except Exception as e:
+            logger.warning("cannot read reply file %s: %s", path, e)
+            return None
+    return raw.encode("utf-8") if raw else None
+
+
+def devicedata_payload():
+    """Return the configured GetDeviceData document as bytes, or None."""
+    return _reply_blob(DEVICEDATA_REPLY, DEVICEDATA_REPLY_FILE)
+
+
 def force_401_endpoint(path, forced=None):
     """True when this request should be answered with the cloud's 401."""
     forced = FORCE_401_PATHS if forced is None else forced
@@ -123,6 +140,11 @@ FORCE_401_BODY = b"401 ACCESS TOKEN IS NOT VALID"
 # real shape either; EDITION_REPLY (inline JSON) or EDITION_REPLY_FILE (path) does that.
 EDITION_REPLY = os.environ.get("EDITION_REPLY", "").strip()
 EDITION_REPLY_FILE = os.environ.get("EDITION_REPLY_FILE", "").strip()
+
+# Serve a captured GetDeviceData document instead of the bridge's own JSON, so a
+# changed field can be handed to the controller exactly as the cloud would.
+DEVICEDATA_REPLY = os.environ.get("DEVICEDATA_REPLY", "").strip()
+DEVICEDATA_REPLY_FILE = os.environ.get("DEVICEDATA_REPLY_FILE", "").strip()
 
 
 def write_tap(record, path=None, full=None):
@@ -691,6 +713,15 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
 
     def handle_get_device_data(self):
         """Compatibility endpoint for status queries."""
+        payload = devicedata_payload()
+        if payload is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         with state_lock:
             data = json.dumps({
                 "readings": readings,
