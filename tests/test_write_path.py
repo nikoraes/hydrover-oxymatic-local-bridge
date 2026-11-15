@@ -72,7 +72,7 @@ def main():
                             "oxy_current": "0.12", "is_pump": "false"})
     bridge.apply_program("WINTER")
     bridge.apply_mode("off")
-    doc = json.loads(bridge.build_document())
+    doc = json.loads(bridge.build_document() or b"{}")
     check("doc is the cloud shape", "Nirvana" not in doc and "IsNirvana" in doc)
     check("doc carries the program", doc["Program"] == 5, doc["Program"])
     check("doc carries mode off", doc["IsOff"] is True and doc["IsAuto"] is False
@@ -84,10 +84,31 @@ def main():
     check("doc omits every field the template has",
           set(doc) >= {"Program", "LastEdition", "RemoteControl", "Model"})
 
+    # a partial write must inherit the controller's other field
+    reset()
+    bridge.settings.update({"Program": "5", "IsAuto": "false", "IsMan": "false",
+                            "IsOff": "true"})
+    bridge.apply_mode("auto")
+    doc = json.loads(bridge.build_document() or b"{}")
+    check("mode-only keeps the controller's program", doc["Program"] == 5, doc["Program"])
+    check("mode-only sets the requested mode",
+          doc["IsAuto"] is True and doc["IsOff"] is False,
+          (doc["IsAuto"], doc["IsOff"]))
+
+    reset()
+    bridge.settings.update({"Program": "5", "IsAuto": "false", "IsMan": "false",
+                            "IsOff": "true"})
+    bridge.apply_program("WINTER")
+    doc = json.loads(bridge.build_document() or b"{}")
+    check("program-only keeps the controller's mode",
+          doc["IsOff"] is True and doc["IsAuto"] is False,
+          (doc["IsAuto"], doc["IsOff"]))
+    check("program-only carries the requested program", doc["Program"] == 5)
+
     # mode man
     reset()
     bridge.apply_mode("man")
-    doc = json.loads(bridge.build_document())
+    doc = json.loads(bridge.build_document() or b"{}")
     check("man sets IsMan only", doc["IsMan"] is True and doc["IsAuto"] is False
           and doc["IsOff"] is False, (doc["IsAuto"], doc["IsMan"], doc["IsOff"]))
 
