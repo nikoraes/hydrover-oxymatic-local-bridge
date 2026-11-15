@@ -260,6 +260,10 @@ MODE_FIELDS = {
 # What HA has asked for; None = follow the controller.
 desired_program = None
 desired_mode = None
+# The last document we served. A document is a complete snapshot, so the next
+# partial write must be layered on this, not on a settings dump that may be
+# hours old (the controller only dumps at boot).
+asserted: dict = {"program": None, "mode": None}
 # Non-zero while an edition is waiting to be picked up (epoch seconds).
 pending_edition = 0.0
 
@@ -303,10 +307,15 @@ def build_document():
     # Only what was asked for is overridden. Everything else keeps the value the
     # controller reported: a mode-only command must not carry the template's
     # Program along with it (that switched PUBLIC POOL on during the AUTO test).
-    program = desired_program if desired_program is not None else current_program_code()
+    if desired_program is not None:
+        program = desired_program
+    elif asserted["program"] is not None:
+        program = asserted["program"]
+    else:
+        program = current_program_code()
     if program is not None:
         doc["Program"] = program
-    mode = desired_mode or current_mode()
+    mode = desired_mode or asserted["mode"] or current_mode()
     if mode in MODE_FIELDS:
         doc.update(MODE_FIELDS[mode])
     now_ms = int(time.time() * 1000)
@@ -595,18 +604,19 @@ def current_program():
 
 def publish_write_state(client, force=False):
     """Publish the program/mode HA has asked for (the select entities' state)."""
-    program_name = PROGRAMS.get(desired_program) if desired_program is not None else current_program()
-    if program_name:
-        publish_state(client, "programma", program_name, component="select",
-                      force=force, attributes={
-                          "code": desired_program if desired_program is not None
-                                  else current_program_code(),
-                          "source": "home-assistant" if desired_program is not None
-                                    else "controller"})
-    mode = desired_mode or current_mode()
+    programme = asserted["program"]
+    if programme is None:
+        programme = desired_program if desired_program is not None else current_program_code()
+    if programme is not None:
+        publish_state(client, "programma", PROGRAMS.get(programme, f"PROGRAMMA {programme}"),
+                      component="select", force=force,
+                      attributes={"code": programme,
+                                  "source": "asserted" if asserted["program"] is not None
+                                            else "controller"})
+    mode = desired_mode or asserted["mode"] or current_mode()
     if mode:
         publish_state(client, "mode_select", mode, component="select", force=force,
-                      attributes={"source": "home-assistant" if desired_mode else "controller"})
+                      attributes={"source": "asserted" if asserted["mode"] else "controller"})
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -669,6 +679,7 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info("Connected to Mosquitto MQTT broker at %s:%d", MQTT_HOST, MQTT_PORT)
         publish_discovery_configs(client)
+        publish_write_state(client, force=True)
         for topic in COMMAND_TOPICS.values():
             client.subscribe(topic)
             logger.info("Subscribed to command topic %s", topic)
@@ -923,9 +934,14 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
                 logger.info("Served document: program=%s mode=%s — edition handed over",
                             desired_program, desired_mode)
                 pending_edition = 0.0
-                # The controller has adopted it; from here the settings dump is
-                # the truth, so a later single-field write does not re-assert
-                # this one.
+                # Remember the snapshot we handed over: the next partial write
+                # layers onto it. The settings dump cannot serve this purpose —
+                # it only arrives at controller boot, so it is usually stale.
+                served = json.loads(doc)
+                asserted["program"] = served.get("Program")
+                asserted["mode"] = (desired_mode
+                                    or asserted["mode"]
+                                    or current_mode())
                 desired_program = None
                 desired_mode = None
                 if mqtt_client and mqtt_client.is_connected():
