@@ -105,6 +105,21 @@ def main():
           (doc["IsAuto"], doc["IsOff"]))
     check("program-only carries the requested program", doc["Program"] == 5)
 
+    # successive partial writes accumulate into one snapshot
+    reset()
+    bridge.asserted.update({"program": 5, "mode": "off"})
+    bridge.apply_mode("auto")
+    doc = json.loads(bridge.build_document() or b"{}")
+    check("asserted base survives a mode write",
+          doc["Program"] == 5 and doc["IsAuto"] is True, (doc["Program"], doc["IsAuto"]))
+    bridge.asserted.update({"program": doc["Program"], "mode": "auto"})
+    reset()
+    bridge.apply_program("PUBLIC POOL")
+    doc = json.loads(bridge.build_document() or b"{}")
+    check("asserted mode survives a program write",
+          doc["Program"] == 11 and doc["IsAuto"] is True,
+          (doc["Program"], doc["IsAuto"]))
+
     # mode man
     reset()
     bridge.apply_mode("man")
