@@ -300,10 +300,15 @@ def build_document():
             pass
     if readings.get("is_pump") is not None:
         doc["IsPump"] = str(readings["is_pump"]).lower() == "true"
-    if desired_program is not None:
-        doc["Program"] = desired_program
-    if desired_mode in MODE_FIELDS:
-        doc.update(MODE_FIELDS[desired_mode])
+    # Only what was asked for is overridden. Everything else keeps the value the
+    # controller reported: a mode-only command must not carry the template's
+    # Program along with it (that switched PUBLIC POOL on during the AUTO test).
+    program = desired_program if desired_program is not None else current_program_code()
+    if program is not None:
+        doc["Program"] = program
+    mode = desired_mode or current_mode()
+    if mode in MODE_FIELDS:
+        doc.update(MODE_FIELDS[mode])
     now_ms = int(time.time() * 1000)
     doc["LastEdition"] = "/Date(%d)/" % now_ms
     doc["LastProgEdition"] = "/Date(%d)/" % now_ms
@@ -559,6 +564,17 @@ def current_mode():
     return None
 
 
+def current_program_code():
+    """The controller's own Program code, as reported in its settings dump."""
+    raw = settings.get("Program")
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return None
+
+
 def current_program():
     """Derive the program name from the controller's numeric Program code."""
     raw = settings.get("Program")
@@ -579,14 +595,18 @@ def current_program():
 
 def publish_write_state(client, force=False):
     """Publish the program/mode HA has asked for (the select entities' state)."""
-    program_name = PROGRAMS.get(desired_program) if desired_program else None
+    program_name = PROGRAMS.get(desired_program) if desired_program is not None else current_program()
     if program_name:
         publish_state(client, "programma", program_name, component="select",
-                      force=force, attributes={"code": desired_program,
-                                               "source": "home-assistant"})
-    if desired_mode:
-        publish_state(client, "mode_select", desired_mode, component="select",
-                      force=force, attributes={"source": "home-assistant"})
+                      force=force, attributes={
+                          "code": desired_program if desired_program is not None
+                                  else current_program_code(),
+                          "source": "home-assistant" if desired_program is not None
+                                    else "controller"})
+    mode = desired_mode or current_mode()
+    if mode:
+        publish_state(client, "mode_select", mode, component="select", force=force,
+                      attributes={"source": "home-assistant" if desired_mode else "controller"})
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -890,7 +910,7 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
 
     def handle_get_device_data(self):
         """Serve the document that carries the requested program/mode."""
-        global pending_edition
+        global pending_edition, desired_program, desired_mode
         if pending_edition and TEMPLATE:
             doc = build_document()
             if doc:
@@ -903,6 +923,11 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
                 logger.info("Served document: program=%s mode=%s — edition handed over",
                             desired_program, desired_mode)
                 pending_edition = 0.0
+                # The controller has adopted it; from here the settings dump is
+                # the truth, so a later single-field write does not re-assert
+                # this one.
+                desired_program = None
+                desired_mode = None
                 if mqtt_client and mqtt_client.is_connected():
                     publish_write_state(mqtt_client, force=True)
                 return
