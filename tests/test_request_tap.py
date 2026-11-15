@@ -81,6 +81,13 @@ def main():
           bridge.edition_payload() == b'[["DataEdition","1794608309"]]', bridge.edition_payload())
     bridge.EDITION_REPLY = ""
 
+    # device-data document: unset by default, served verbatim when configured
+    check("no devicedata payload by default", bridge.devicedata_payload() is None)
+    bridge.DEVICEDATA_REPLY = '{"Program":6}'
+    check("devicedata payload is served verbatim",
+          bridge.devicedata_payload() == b'{"Program":6}', bridge.devicedata_payload())
+    bridge.DEVICEDATA_REPLY = ""
+
     # 401 experiment switch: off unless explicitly configured, path-matched only
     check("force_401 off by default", bridge.force_401_endpoint("/rest/GetLastEdition", []) is False)
     check("force_401 matches the configured path",
