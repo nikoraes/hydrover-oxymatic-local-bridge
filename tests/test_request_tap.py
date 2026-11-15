@@ -74,6 +74,13 @@ def main():
     check("first line is the first request", json.loads(lines[0])["path"] == "/a?b=1")
     check("second line is the second request", json.loads(lines[1])["path"] == "/a?b=2")
 
+    # edition payload: unset by default, served verbatim when configured
+    check("no edition payload by default", bridge.edition_payload() is None)
+    bridge.EDITION_REPLY = '[["DataEdition","1794608309"]]'
+    check("edition payload is served verbatim",
+          bridge.edition_payload() == b'[["DataEdition","1794608309"]]', bridge.edition_payload())
+    bridge.EDITION_REPLY = ""
+
     # 401 experiment switch: off unless explicitly configured, path-matched only
     check("force_401 off by default", bridge.force_401_endpoint("/rest/GetLastEdition", []) is False)
     check("force_401 matches the configured path",

@@ -67,6 +67,19 @@ import paho.mqtt.client as mqtt
 REQUEST_LOG_PATH = os.environ.get("REQUEST_LOG", "/tmp/bridge-requests.jsonl")
 
 
+def edition_payload():
+    """Return the configured edition payload as bytes, or None when unset."""
+    raw = EDITION_REPLY
+    if not raw and EDITION_REPLY_FILE:
+        try:
+            with open(EDITION_REPLY_FILE, encoding="utf-8") as f:
+                raw = f.read().strip()
+        except Exception as e:
+            logger.warning("cannot read EDITION_REPLY_FILE %s: %s", EDITION_REPLY_FILE, e)
+            return None
+    return raw.encode("utf-8") if raw else None
+
+
 def force_401_endpoint(path, forced=None):
     """True when this request should be answered with the cloud's 401."""
     forced = FORCE_401_PATHS if forced is None else forced
@@ -104,6 +117,12 @@ TAP_FULL = os.environ.get("TAP_FULL", "").lower() in ("1", "true", "yes")
 # Empty by default; never affects normal operation.
 FORCE_401_PATHS = [p.strip() for p in os.environ.get("FORCE_401_PATHS", "").split(",") if p.strip()]
 FORCE_401_BODY = b"401 ACCESS TOKEN IS NOT VALID"
+
+# Serve a captured edition payload to the controller instead of the bare "OK".
+# The controller never acted on invented replies, but it has never been handed the
+# real shape either; EDITION_REPLY (inline JSON) or EDITION_REPLY_FILE (path) does that.
+EDITION_REPLY = os.environ.get("EDITION_REPLY", "").strip()
+EDITION_REPLY_FILE = os.environ.get("EDITION_REPLY_FILE", "").strip()
 
 
 def write_tap(record, path=None, full=None):
@@ -655,10 +674,14 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
     def handle_get_last_edition(self, params):
         """Reply to the controller's edition poll.
 
-        The controller applies nothing we return (see module docstring), so
-        there is no edition to hand out: answer a plain OK.
+        Default: a plain OK (nothing has been observed to be applied).
+        With EDITION_REPLY / EDITION_REPLY_FILE set, the captured payload is served
+        verbatim so the controller can be observed reacting to a real edition.
         """
         body = b"OK"
+        payload = edition_payload()
+        if payload is not None:
+            body = payload
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
