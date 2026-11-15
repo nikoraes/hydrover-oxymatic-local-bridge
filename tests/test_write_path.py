@@ -138,6 +138,38 @@ def main():
     check("DataEdition matches the queue",
           int(ed[0][1]) == int(bridge.pending_edition), (ed[0], bridge.pending_edition))
 
+    # a restart must not fall back to the template's mode flags
+    class Msg:
+        def __init__(self, topic, payload):
+            self.topic, self.payload = topic, payload
+
+    bridge.settings.clear()
+    bridge.asserted.update({"program": None, "mode": None})
+    reset()
+    bridge.on_mqtt_message(None, None, Msg(
+        bridge.STATE_TOPICS["settings"], b'{"Program":"5","IsAuto":false,"IsMan":false,"IsOff":true}'))
+    check("settings restored from the retained mirror",
+          bridge.settings.get("Program") == "5" and bridge.current_mode() == "off",
+          (bridge.settings.get("Program"), bridge.current_mode()))
+
+    bridge.on_mqtt_message(None, None, Msg(
+        bridge.STATE_TOPICS["document"], b'{"Program":7,"IsAuto":true,"IsMan":false,"IsOff":false}'))
+    check("last served document restored from the retained mirror",
+          bridge.asserted["program"] == 7 and bridge.asserted["mode"] == "auto",
+          dict(bridge.asserted))
+
+    bridge.readings.clear()
+    bridge.apply_mode("off")
+    doc = json.loads(bridge.build_document() or b"{}")
+    check("mode write after a restart keeps the restored program",
+          doc["Program"] == 7 and doc["IsOff"] is True and doc["IsAuto"] is False,
+          (doc["Program"], doc["IsOff"], doc["IsAuto"]))
+
+    check("flags map to a mode",
+          bridge.mode_from_flags({"IsAuto": True, "IsMan": False, "IsOff": False}) == "auto")
+    check("string flags count too",
+          bridge.mode_from_flags({"IsOff": "true"}) == "off")
+
     # command topics are what HA will publish to
     check("program command topic", bridge.COMMAND_TOPICS["program"] == "oxymatic/set/program")
     check("mode command topic", bridge.COMMAND_TOPICS["mode"] == "oxymatic/set/mode")

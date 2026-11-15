@@ -272,6 +272,15 @@ COMMAND_TOPICS = {
     "mode": "oxymatic/set/mode",
 }
 
+# The controller only dumps its settings at boot, so a pod restart loses the
+# authoritative state and anything derived from it. Both are mirrored to retained
+# topics: the broker hands them back on connect, so a fresh pod resumes from what
+# was true instead of falling back to the template's mode flags.
+STATE_TOPICS = {
+    "document": "oxymatic/state/document",
+    "settings": "oxymatic/state/settings",
+}
+
 
 def load_template(path=None):
     try:
@@ -573,6 +582,16 @@ def current_mode():
     return None
 
 
+def mode_from_flags(blob):
+    """Which mode a document/settings blob is asserting, from its position flags."""
+    if not isinstance(blob, dict):
+        return None
+    for mode, flag in MODE_FLAGS.items():
+        if blob.get(flag) is True or str(blob.get(flag, "")).lower() == "true":
+            return mode
+    return None
+
+
 def current_program_code():
     """The controller's own Program code, as reported in its settings dump."""
     raw = settings.get("Program")
@@ -625,6 +644,26 @@ def on_mqtt_message(client, userdata, msg):
     try:
         value = msg.payload.decode("utf-8", "replace").strip()
     except Exception:
+        return
+    if topic == STATE_TOPICS["settings"]:
+        if not settings:
+            try:
+                settings.update(json.loads(value))
+                logger.info("Restored settings from retained mirror: mode=%s program=%s",
+                            current_mode(), current_program())
+            except ValueError:
+                pass
+        return
+    if topic == STATE_TOPICS["document"]:
+        if asserted["program"] is None and asserted["mode"] is None:
+            try:
+                blob = json.loads(value)
+            except ValueError:
+                return
+            asserted["program"] = blob.get("Program")
+            asserted["mode"] = mode_from_flags(blob)
+            logger.info("Restored the last served document: program=%s mode=%s",
+                        asserted["program"], asserted["mode"])
         return
     logger.info("MQTT command on %s: %r", topic, value)
     if topic == COMMAND_TOPICS["program"]:
@@ -680,6 +719,8 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
         logger.info("Connected to Mosquitto MQTT broker at %s:%d", MQTT_HOST, MQTT_PORT)
         publish_discovery_configs(client)
         publish_write_state(client, force=True)
+        for topic in STATE_TOPICS.values():
+            client.subscribe(topic)
         for topic in COMMAND_TOPICS.values():
             client.subscribe(topic)
             logger.info("Subscribed to command topic %s", topic)
@@ -893,6 +934,8 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
                 )
 
             if mqtt_client and mqtt_client.is_connected():
+                mqtt_client.publish(STATE_TOPICS["settings"],
+                                    json.dumps(dict(settings)), retain=True)
                 publish_settings_state(mqtt_client, force=changed)
 
     def handle_get_last_edition(self, params):
@@ -939,9 +982,10 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
                 # it only arrives at controller boot, so it is usually stale.
                 served = json.loads(doc)
                 asserted["program"] = served.get("Program")
-                asserted["mode"] = (desired_mode
-                                    or asserted["mode"]
-                                    or current_mode())
+                asserted["mode"] = mode_from_flags(served) or asserted["mode"]
+                if mqtt_client and mqtt_client.is_connected():
+                    mqtt_client.publish(STATE_TOPICS["document"],
+                                        json.dumps(served), retain=True)
                 desired_program = None
                 desired_mode = None
                 if mqtt_client and mqtt_client.is_connected():
