@@ -270,6 +270,7 @@ pending_edition = 0.0
 COMMAND_TOPICS = {
     "program": "oxymatic/set/program",
     "mode": "oxymatic/set/mode",
+    "state": "oxymatic/set/state",
 }
 
 # The controller only dumps its settings at boot, so a pod restart loses the
@@ -348,20 +349,80 @@ def request_edition():
     logger.info("Edition queued (program=%s mode=%s)", desired_program, desired_mode)
 
 
+def known_program():
+    """The program the bridge can vouch for: intent, last serve, or the dump."""
+    if desired_program is not None:
+        return desired_program
+    if asserted["program"] is not None:
+        return asserted["program"]
+    return current_program_code()
+
+
+def known_mode():
+    if desired_mode is not None:
+        return desired_mode
+    if asserted["mode"] is not None:
+        return asserted["mode"]
+    return current_mode()
+
+
+def apply_state(value):
+    """Set program and mode together: 'WINTER:off' or a JSON object.
+
+    The document is authoritative for every field it carries, and a single-field
+    command has to inherit the other from something. When nothing is known (fresh
+    pod, controller has not dumped yet) that inheritance would fall back to the
+    template's defaults, which is how the unit ended up on PUBLIC POOL twice.
+    """
+    text = str(value).strip()
+    if text.startswith("{"):
+        try:
+            blob = json.loads(text)
+            program, mode = blob.get("program"), blob.get("mode")
+        except ValueError:
+            logger.warning("ignoring unparseable state command %r", value)
+            return False
+    else:
+        parts = [p.strip() for p in text.split(":")]
+        if len(parts) != 2:
+            logger.warning("state command wants 'PROGRAM:MODE', got %r", value)
+            return False
+        program, mode = parts
+    global desired_program, desired_mode
+    code = program_code(program)
+    mode_text = str(mode).strip().lower()
+    if code is None or mode_text not in MODE_FIELDS:
+        logger.warning("state command rejected %r", value)
+        return False
+    desired_program = code
+    desired_mode = mode_text
+    request_edition()
+    return True
+
+
+def program_code(value):
+    """Resolve a program name or numeric code to the controller's code."""
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    for name, code in PROGRAM_CODES.items():
+        if name.lower() == text.lower():
+            return code
+    return None
+
+
 def apply_program(value):
     """Set the desired program from a name or a numeric code."""
     global desired_program
-    text = str(value).strip()
-    code = None
-    if text.isdigit():
-        code = int(text)
-    else:
-        for name, c in PROGRAM_CODES.items():
-            if name.lower() == text.lower():
-                code = c
-                break
+    code = program_code(value)
     if code is None:
         logger.warning("ignoring unknown program %r", value)
+        return False
+    if known_mode() is None and desired_mode is None:
+        logger.warning("refusing program %r: the controller's mode is unknown, so a "
+                       "document would assert the template's IsAuto. Set both with "
+                       "'%s' (PROGRAM:MODE) or power-cycle the controller.",
+                       value, "oxymatic/set/state")
         return False
     desired_program = code
     request_edition()
@@ -373,6 +434,12 @@ def apply_mode(value):
     text = str(value).strip().lower()
     if text not in MODE_FIELDS:
         logger.warning("ignoring unknown mode %r (want auto/man/off)", value)
+        return False
+    if known_program() is None and desired_program is None:
+        logger.warning("refusing mode %r: the controller's program is unknown, so a "
+                       "document would assert the template's Program. Set both with "
+                       "'%s' (PROGRAM:MODE) or power-cycle the controller.",
+                       value, "oxymatic/set/state")
         return False
     desired_mode = text
     request_edition()
@@ -671,6 +738,9 @@ def on_mqtt_message(client, userdata, msg):
             publish_write_state(client, force=True)
     elif topic == COMMAND_TOPICS["mode"]:
         if apply_mode(value):
+            publish_write_state(client, force=True)
+    elif topic == COMMAND_TOPICS["state"]:
+        if apply_state(value):
             publish_write_state(client, force=True)
 
 
@@ -974,13 +1044,13 @@ class OxymaticRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(doc)
-                logger.info("Served document: program=%s mode=%s — edition handed over",
-                            desired_program, desired_mode)
-                pending_edition = 0.0
                 # Remember the snapshot we handed over: the next partial write
                 # layers onto it. The settings dump cannot serve this purpose —
                 # it only arrives at controller boot, so it is usually stale.
                 served = json.loads(doc)
+                logger.info("Served document: program=%s mode=%s — edition handed over",
+                            served.get("Program"), mode_from_flags(served))
+                pending_edition = 0.0
                 asserted["program"] = served.get("Program")
                 asserted["mode"] = mode_from_flags(served) or asserted["mode"]
                 if mqtt_client and mqtt_client.is_connected():
